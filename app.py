@@ -12,9 +12,58 @@ from scoring import (
     SEGMENT_LABELS,
 )
 
+# ── Decision tag helpers ───────────────────────────────────────────────────────
+
+def _bid_tag(sv):
+    """Return (tag_text, tag_color) for a bid vehicle."""
+    counts = DEFAULT_LOT_STATE["segment_counts"]
+    targets = DEFAULT_LOT_STATE["segment_targets"]
+    seg = sv["segment"]
+    current = counts.get(seg, 0)
+    target = targets.get(seg, 10)
+    segment_need_score = max(0.0, (target - current) / max(target, 1))
+    velocities = DEFAULT_LOT_STATE["recent_velocity_30d"]
+    seg_vel = velocities.get(seg, 0)
+    avg_vel = sum(velocities.values()) / max(len(velocities), 1)
+    velocity_score = min(1.0, seg_vel / max(avg_vel, 0.01))
+
+    if segment_need_score > 0.3:
+        return "Fill shortage", "#1abc9c"
+    if velocity_score > 0.7 and segment_need_score > 0:
+        return "Fast turn", "#16a085"
+    if sv.get("condition", 0) >= 4.0 and (sv.get("recon_cost") or 0) < 500:
+        return "Low recon", "#27ae60"
+    if (sv.get("expected_margin") or 0) > 2000:
+        return "Safe margin", "#2ecc71"
+    return "Strategic stretch", "#7f8c8d"
+
+
+def _skip_tag(sv):
+    """Return (tag_text, tag_color) for a skip vehicle."""
+    reason = sv.get("skip_reason", "")
+    if reason == "segment_overexposed":
+        return "Overexposed", "#e74c3c"
+    if reason == "recon_risk":
+        return "Too much recon", "#e67e22"
+    if reason == "margin_insufficient":
+        ceiling = sv.get("bid_ceiling") or 0
+        ask = sv.get("auction_price", 0)
+        gap_pct = (ask - ceiling) / max(ask, 1) if ask > 0 else 1
+        if gap_pct > 0.20:
+            return "Underwater", "#c0392b"
+        return "Thin margin", "#e74c3c"
+    if reason == "wholesale_softening":
+        return "Weak exit", "#e67e22"
+    if reason == "recon_queue_full":
+        return "Queue full", "#f39c12"
+    if reason == "slow_segment":
+        return "Slow segment", "#f39c12"
+    return "Crowds out better buys", "#95a5a6"
+
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Merchant — Auction Drop",
+    page_title="Crossline — Auction Drop Decision Engine",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -48,7 +97,8 @@ if "manifest_input_df" not in st.session_state:
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("Merchant")
+    st.image("crossline_logo.png", width=200)
+    st.markdown("## CROSSLINE")
 
     st.subheader("Lot Settings")
     ls = DEFAULT_LOT_STATE
@@ -67,6 +117,16 @@ with st.sidebar:
         "recon_queue_depth": int(recon_queue), "avg_days_on_lot": float(avg_days),
         "daily_carry_rate": float(daily_carry),
     }
+
+    with st.expander("Segment targets & reasoning"):
+        for seg, target in DEFAULT_LOT_STATE["segment_targets"].items():
+            current = DEFAULT_LOT_STATE["segment_counts"].get(seg, 0)
+            velocity = DEFAULT_LOT_STATE["recent_velocity_30d"].get(seg, 0)
+            delta = current - target
+            status_word = "over" if delta > 0 else "under"
+            seg_label = SEGMENT_LABELS.get(seg, seg)
+            st.markdown(f"**{seg_label}**: {current} / {target} target ({abs(delta)} {status_word})")
+            st.caption(f"Target = {velocity} sold/mo × 1.5mo supply, max 15% of lot")
 
     st.divider()
     st.subheader("Market Shocks")
@@ -147,6 +207,18 @@ with tab1:
                     if col not in upload_df.columns:
                         upload_df[col] = ""
                 upload_df = upload_df.fillna({"trim": "", "notes": ""})
+                # Remove blank rows
+                upload_df = upload_df.dropna(how="all")
+                # Exclude non-numeric auction prices
+                if "auction_price" in upload_df.columns:
+                    upload_df["auction_price"] = pd.to_numeric(upload_df["auction_price"], errors="coerce")
+                # Clamp condition values
+                if "condition" in upload_df.columns:
+                    upload_df["condition"] = pd.to_numeric(upload_df["condition"], errors="coerce")
+                    clamped = upload_df["condition"].notna() & ~upload_df["condition"].between(1.0, 5.0, inclusive="both")
+                    if clamped.any():
+                        upload_df["condition"] = upload_df["condition"].clip(1.0, 5.0)
+                        st.warning(f"Condition values in {clamped.sum()} row(s) were clamped to 1.0–5.0 range.")
                 st.session_state["manifest_input_df"] = upload_df[list(required_cols) + ["trim", "notes"]]
                 st.success(f"Loaded {len(upload_df)} vehicles from CSV.")
             else:
@@ -166,6 +238,12 @@ with tab1:
             "auction_price": st.column_config.NumberColumn("Auction Price ($)", min_value=1, step=100),
             "trim":          st.column_config.TextColumn("Trim (optional)"),
             "notes":         st.column_config.TextColumn("Notes (optional)"),
+            "retail_estimate": st.column_config.NumberColumn(
+                "Retail Est. (optional)",
+                help="Override the model's retail estimate if you know the vehicle's value",
+                min_value=0,
+                format="$%.0f",
+            ),
         },
         use_container_width=True,
         key="manifest_editor",
@@ -207,6 +285,7 @@ with tab1:
                 "condition": float(row["condition"]), "auction_price": float(row["auction_price"]),
                 "trim": str(row.get("trim", "") or "").strip(),
                 "notes": str(row.get("notes", "") or "").strip(),
+                "retail_estimate": float(row["retail_estimate"]) if "retail_estimate" in row and pd.notna(row.get("retail_estimate")) else None,
             })
         scored = score_manifest(records, lot_state, active_shocks)
         st.session_state.scored = scored
@@ -320,8 +399,15 @@ with tab1:
             with st.container(border=True):
                 hc, bc = st.columns([5, 1])
                 hc.markdown(f"**#{rank_idx} — {sv['label']}**")
+                tag_text, tag_color = _bid_tag(sv)
+                hc.markdown(
+                    f"<span style='background:{tag_color};color:white;padding:2px 8px;border-radius:10px;font-size:0.75rem'>{tag_text}</span>",
+                    unsafe_allow_html=True,
+                )
                 hc.caption(f"{SEGMENT_LABELS.get(sv['segment'], sv['segment'])}  ·  "
                            f"Cond {sv['condition']:.1f}  ·  {sv['mileage']:,} mi")
+                if not sv.get("segment_is_mapped", True):
+                    st.warning("Unrecognized vehicle — retail estimate may be inaccurate. Review manually before bidding.")
                 if bc.button("Skip →", key=f"skip_{vid}", use_container_width=True):
                     st.session_state.bid_status[vid] = "skip"
                     st.session_state.manual_overrides.add(vid)
@@ -392,6 +478,11 @@ with tab1:
                     with st.container(border=True):
                         sc1, sc2 = st.columns([5, 1])
                         sc1.markdown(f"**{sv['label']}**")
+                        tag_text, tag_color = _skip_tag(sv)
+                        sc1.markdown(
+                            f"<span style='background:{tag_color};color:white;padding:2px 8px;border-radius:10px;font-size:0.75rem'>{tag_text}</span>",
+                            unsafe_allow_html=True,
+                        )
                         sc1.caption(f"{SEGMENT_LABELS.get(sv['segment'], sv['segment'])}  ·  "
                                     f"Cond {sv['condition']:.1f}  ·  Ask: ${sv.get('auction_price', 0):,.0f}")
                         if not sv.get("is_condition_fail", False):
@@ -402,11 +493,28 @@ with tab1:
                                                           st.session_state.bid_status, lot_state)
                                 st.session_state.displacement_msg = disp
                                 st.rerun()
-                        st.caption(sv.get("skip_detail", ""))
-                        if sv.get("would_bid_if"):
-                            st.caption(f"Would bid if: _{sv['would_bid_if']}_")
-                        if sv.get("bid_ceiling") is not None:
-                            st.caption(f"Model ceiling: ${sv['bid_ceiling']:,.0f}")
+                        if sv.get("skip_reason") == "margin_insufficient":
+                            ceiling = sv.get("bid_ceiling") or 0
+                            ask = sv.get("auction_price", 0)
+                            gap = ask - ceiling
+                            margin = sv.get("expected_margin") or 0
+                            if sv.get("no_viable_bid"):
+                                st.markdown(f"**No viable bid**  \n_{sv.get('ceiling_display_note', '')}_")
+                            else:
+                                st.markdown(
+                                    f"**Bid ceiling:** ${ceiling:,.0f}  \n"
+                                    f"**Ask:** ${ask:,.0f}  \n"
+                                    f"**Gap:** <span style='color:red'>-${gap:,.0f}</span>  \n"
+                                    f"**Margin at ask:** <span style='color:red'>${margin:,.0f}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                                st.caption(f"_Would bid if auction price drops below ${ceiling:,.0f}_")
+                        else:
+                            st.caption(sv.get("skip_detail", ""))
+                            if sv.get("would_bid_if"):
+                                st.caption(f"Would bid if: _{sv['would_bid_if']}_")
+                            if sv.get("bid_ceiling") is not None:
+                                st.caption(f"Model ceiling: ${sv['bid_ceiling']:,.0f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -716,4 +824,4 @@ with tab3:
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption("Merchant — Auction Drop Decision Engine  ·  Synthetic data demo  ·  v0.2")
+st.caption("Crossline v0.2 — Auction Drop Decision Engine")

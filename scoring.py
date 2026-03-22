@@ -55,6 +55,7 @@ SEGMENT_LABELS: dict[str, str] = {
     "midsize_suv": "Midsize SUV", "full_size_suv": "Full-Size SUV",
     "pickup_full_size": "Full-Size Pickup", "pickup_midsize": "Midsize Pickup",
     "minivan": "Minivan", "luxury": "Luxury", "sports": "Sports", "other": "Other",
+    "unrecognized": "Unrecognized",
 }
 
 SUV_SEGMENTS: frozenset[str] = frozenset({"compact_suv", "midsize_suv", "full_size_suv"})
@@ -329,7 +330,7 @@ def score_portfolio_fit(
     velocity_score = min(1.0, seg_velocity / max(avg_velocity, 0.01))
     recon_total = lot_state["recon_bays_total"]
     recon_queue = lot_state.get("recon_queue_depth", 0)
-    max_acceptable = recon_total * 1.5
+    max_acceptable = recon_total * 1.2
     projected_queue = recon_queue + sum(bid_segment_counts.values())
     recon_capacity_score = max(0.0, 1.0 - (projected_queue / max(max_acceptable, 1)))
     new_count = current_count + 1
@@ -448,10 +449,10 @@ def _generate_rationale(sv: dict, lot_state: dict) -> str:
 
 
 def _apply_rank_and_cut(candidates: list[dict], lot_state: dict) -> tuple[list[dict], list[dict]]:
-    """Walk sorted candidates, cut when projected recon queue > 2.5× bays."""
+    """Walk sorted candidates, cut when projected recon queue > 1.2× bays."""
     recon_queue = lot_state.get("recon_queue_depth", 0)
     recon_bays = lot_state["recon_bays_total"]
-    max_queue = recon_bays * 2.5
+    max_queue = recon_bays * 1.2
     final_bids, recon_cuts = [], []
     accumulated_days = 0.0
     for sv in candidates:
@@ -501,6 +502,7 @@ def score_manifest(manifest: list[dict], lot_state: dict, active_shocks: set[str
                 trim=trim, notes=notes, segment=segment, segment_is_mapped=is_mapped,
                 recon_cost=0.0, recon_days=0, expected_retail=0.0,
                 bid_ceiling=None, expected_margin=None, portfolio_fit=None,
+                no_viable_bid=False, ceiling_display_note="",
                 rank_score=0.0, status="skip", skip_reason="condition_fail",
                 skip_detail=f"Notes contain '{fail_kw}' — non-overridable skip.",
                 would_bid_if=None, is_condition_fail=True, rationale="", rank=None,
@@ -515,10 +517,31 @@ def score_manifest(manifest: list[dict], lot_state: dict, active_shocks: set[str
         # Step 4: Bid ceiling
         demand_delta = demand_deltas.get(segment, 0.0)
         risk_delta = risk_deltas.get(segment, 0.0)
-        expected_retail = estimate_retail_price(segment, year, mileage, condition, demand_delta)
-        bid_ceiling, target_margin, expected_margin = calculate_bid_ceiling(
+        retail_estimate_override = v.get("retail_estimate")
+        if retail_estimate_override and retail_estimate_override > 0:
+            expected_retail = float(retail_estimate_override)
+        else:
+            expected_retail = estimate_retail_price(segment, year, mileage, condition, demand_delta)
+        bid_ceiling, target_margin, _ceiling_margin = calculate_bid_ceiling(
             expected_retail, recon_cost, segment, modified_lot, risk_delta
         )
+
+        # Compute actual expected margin based on auction price (not ceiling)
+        mc = DEFAULT_MARKET_CONTEXT
+        avg_days_to_sale = mc["avg_days_to_sale_by_segment"].get(segment, 30)
+        daily_carry = modified_lot.get("daily_carry_rate", mc["daily_carry_rate"])
+        carry_cost = avg_days_to_sale * daily_carry
+        actual_margin = expected_retail - auction_price - recon_cost - carry_cost
+
+        # Handle very low ceiling display
+        no_viable_bid = False
+        ceiling_display_note = ""
+        if bid_ceiling < 2000:
+            no_viable_bid = True
+            if bid_ceiling < 0:
+                ceiling_display_note = f"This vehicle costs more to prepare and hold than it would sell for. Est. retail: ${expected_retail:,.0f}"
+            else:
+                ceiling_display_note = f"Est. retail: ${expected_retail:,.0f} — too low to cover recon (${recon_cost:,.0f}) and carry (${carry_cost:,.0f}) with margin"
 
         sv = dict(
             vid=vid, label=label, year=year, make=make, model=model,
@@ -527,7 +550,8 @@ def score_manifest(manifest: list[dict], lot_state: dict, active_shocks: set[str
             recon_cost=round(recon_cost, 0), recon_days=recon_days,
             expected_retail=round(expected_retail, 0),
             bid_ceiling=round(bid_ceiling, 0),
-            expected_margin=round(expected_margin, 0),
+            expected_margin=round(actual_margin, 0),
+            no_viable_bid=no_viable_bid, ceiling_display_note=ceiling_display_note,
             portfolio_fit=0.0, rank_score=0.0,
             status="bid", skip_reason="", skip_detail="", would_bid_if="",
             is_condition_fail=False, rationale="", rank=None,
