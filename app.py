@@ -185,6 +185,313 @@ if st.session_state.scored_flag and frozenset(active_shocks) != st.session_state
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["Auction Drop", "Current Lot", "Export"])
+# TAB 2 — CURRENT LOT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.header("Current Lot")
+    st.caption("Existing portfolio — the lot state context the auction model scores against.")
+
+    # Apply filters
+    filt = df.copy()
+    if sel_source != "All": filt = filt[filt["source_channel"] == sel_source]
+    if sel_ret    != "All": filt = filt[filt["retailability_state"] == sel_ret]
+    if sel_market != "All": filt = filt[filt["market_cluster"] == sel_market]
+    if sel_body   != "All": filt = filt[filt["body_type"] == sel_body]
+    if sel_price  != "All": filt = filt[filt["price_band"] == sel_price]
+    if sel_age    != "All": filt = filt[filt["age_band"] == sel_age]
+
+    if filt.empty:
+        st.warning("No cohorts match the selected filters. Adjust Portfolio Analysis Settings in the sidebar.")
+    else:
+        # Segment overview
+        st.subheader("Segment Overview (Lot State)")
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            seg_counts  = lot_state["segment_counts"]
+            seg_targets = lot_state["segment_targets"]
+            seg_names   = [SEGMENT_LABELS.get(s, s) for s in seg_counts]
+            fig_seg = go.Figure()
+            fig_seg.add_bar(name="Current", x=seg_names, y=list(seg_counts.values()),
+                            marker_color="#2980b9", opacity=0.85)
+            fig_seg.add_scatter(name="Target", x=seg_names, y=list(seg_targets.values()),
+                                mode="markers", marker=dict(color="#e74c3c", size=10, symbol="diamond"))
+            fig_seg.update_layout(title="Segment Counts vs Targets", height=300,
+                                  margin=dict(t=40, b=60), xaxis_tickangle=-45)
+            st.plotly_chart(fig_seg, use_container_width=True)
+
+        with sc2:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Recon Bays",    lot_state["recon_bays_total"])
+            r2.metric("Occupied",      lot_state["recon_bays_occupied"])
+            r3.metric("Queue Depth",   lot_state["recon_queue_depth"])
+            r4.metric("Avg Days",      f"{lot_state['avg_days_on_lot']:.0f}")
+
+            wi_data = lot_state["wholesale_index_deltas"]
+            wi_rows = [{"Segment": SEGMENT_LABELS.get(s, s), "Delta": f"{v*100:+.1f}%"}
+                       for s, v in wi_data.items() if v != 0.0]
+            if wi_rows:
+                st.markdown("**Wholesale Index Movement**")
+                st.dataframe(pd.DataFrame(wi_rows), hide_index=True, use_container_width=True, height=220)
+
+        st.divider()
+        st.subheader("Cohort Portfolio")
+
+        BASE_SCENARIO = {"wholesale_shock": 0.0, "demand_mult": 1.0, "recon_pressure": "medium"}
+
+        @st.cache_data
+        def compute_portfolio_stats(cohort_ids_json):
+            all_df = load_data()
+            results = []
+            for _, row in all_df.iterrows():
+                r  = evaluate_cohort(row, BASE_SCENARIO, "Balanced", 0.0, 30)
+                cd = r["crossover_day"]
+                results.append({
+                    "cohort_id": row["cohort_id"],
+                    "ev_gap": r["best_ev_hold"] - r["ev_wholesale"],
+                    "at_risk": 1 if (cd is not None and cd <= 10) else 0,
+                    "crossover_day_base": cd,
+                })
+            return pd.DataFrame(results)
+
+        portfolio_stats = compute_portfolio_stats(str(sorted(df["cohort_id"].tolist())))
+        filt_stats      = filt.merge(portfolio_stats, on="cohort_id")
+
+        at_risk_n  = int(filt_stats["at_risk"].sum())
+        recon_n    = int(filt[filt["retailability_state"].isin(["recon_heavy", "recon_light"])].shape[0])
+        total_n    = len(filt)
+        total_u    = int(filt["cohort_units"].sum())
+        est_val    = float((filt["current_expected_retail_price"] * filt["cohort_units"]).sum())
+        avg_d      = float(filt["days_since_acquisition"].mean())
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Cohorts",             total_n)
+        k2.metric("Total Units",         f"{total_u:,}")
+        k3.metric("Est. Portfolio Value", f"${est_val:,.0f}")
+        k4.metric("At Risk (≤10d)",      f"{at_risk_n}", delta=f"{at_risk_n/total_n*100:.0f}%", delta_color="inverse")
+        k5.metric("Recon Trapped",       f"{recon_n}",   delta=f"{recon_n/total_n*100:.0f}%",   delta_color="inverse")
+        st.caption(f"Avg days since acquisition: **{avg_d:.1f}**")
+
+        STATE_COLORS = {
+            "frontline_ready": "#27ae60", "recon_light": "#f39c12",
+            "recon_heavy": "#e74c3c",     "borderline_retail": "#e67e22",
+            "wholesale_likely": "#c0392b",
+        }
+
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            ret_cnt = (filt.groupby("retailability_state")["cohort_id"].count().reset_index()
+                       .rename(columns={"cohort_id": "Cohorts", "retailability_state": "State"}))
+            fig_bar = px.bar(ret_cnt, x="State", y="Cohorts", color="State",
+                             color_discrete_map=STATE_COLORS, title="Cohorts by Retailability State")
+            fig_bar.update_layout(showlegend=False, height=300, margin=dict(t=40, b=30))
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with pc2:
+            fig_scat = px.scatter(
+                filt_stats, x="days_since_acquisition", y="ev_gap",
+                color="retailability_state", color_discrete_map=STATE_COLORS,
+                hover_data=["cohort_id", "market_cluster", "body_type", "crossover_day_base"],
+                title="Days Since Acquisition vs EV Gap",
+                labels={"days_since_acquisition": "Days Since Acq.", "ev_gap": "EV Gap ($)", "retailability_state": "State"},
+            )
+            fig_scat.add_hline(y=0, line_dash="dash", line_color="#e74c3c",
+                               annotation_text="Wholesale Beats Retail", annotation_position="bottom right")
+            fig_scat.update_layout(height=300, showlegend=False, margin=dict(t=40, b=30))
+            st.plotly_chart(fig_scat, use_container_width=True)
+
+        # Cohort Drilldown
+        st.divider()
+        st.subheader("Cohort Drilldown")
+        cohort_ids = filt["cohort_id"].tolist()
+
+        def cohort_label(cid):
+            row = filt[filt["cohort_id"] == cid].iloc[0]
+            return (f"{cid}  ·  {row['retailability_state'].replace('_',' ').title()}  ·  "
+                    f"{row['market_cluster']}  ·  {row['body_type'].upper()}")
+
+        sel_id = st.selectbox("Select a cohort:", cohort_ids, format_func=cohort_label, key="cohort_sel")
+
+        display_df = filt[[
+            "cohort_id", "market_cluster", "source_channel", "retailability_state",
+            "body_type", "price_band", "age_band", "cohort_units",
+            "days_since_acquisition", "current_expected_retail_price", "wholesale_floor_price",
+        ]].copy()
+        display_df["current_expected_retail_price"] = display_df["current_expected_retail_price"].map("${:,.0f}".format)
+        display_df["wholesale_floor_price"]          = display_df["wholesale_floor_price"].map("${:,.0f}".format)
+        display_df.columns = ["Cohort ID", "Market", "Source", "Retailability",
+                               "Body", "Price Band", "Age Band", "Units",
+                               "Days Acq.", "Retail Price", "Wholesale Floor"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=220)
+
+        cohort  = filt[filt["cohort_id"] == sel_id].iloc[0]
+        results = evaluate_cohort(cohort, portfolio_scenario, strategy_mode, markdown_pct, hold_horizon)
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.markdown("**Descriptor**")
+            for lbl, val in [("Body", cohort["body_type"].capitalize()),
+                              ("Age Band", cohort["age_band"].replace("_", " ")),
+                              ("Mileage Band", cohort["mileage_band"].replace("_", " ")),
+                              ("Source", cohort["source_channel"].replace("_", " ").title()),
+                              ("Market", cohort["market_cluster"]),
+                              ("Units", cohort["cohort_units"])]:
+                st.markdown(f"- {lbl}: **{val}**")
+        with d2:
+            st.markdown("**Timing**")
+            for lbl, val in [("Days Since Acq.", cohort["days_since_acquisition"]),
+                              ("Days in Recon", cohort["days_in_recon"]),
+                              ("Retailability", cohort["retailability_state"].replace("_", " ").title())]:
+                st.markdown(f"- {lbl}: **{val}**")
+        with d3:
+            st.markdown("**Economics**")
+            for lbl, val in [("Acquisition Cost", f"${cohort['avg_acquisition_cost']:,.0f}"),
+                              ("Expected Recon", f"${cohort['expected_recon_cost']:,.0f}"),
+                              ("Retail Price", f"${cohort['current_expected_retail_price']:,.0f}"),
+                              ("Wholesale Floor", f"${cohort['wholesale_floor_price']:,.0f}"),
+                              ("Market Demand", f"{cohort['market_demand_index']:.2f}")]:
+                st.markdown(f"- {lbl}: **{val}**")
+
+        # Crossover Clock
+        st.divider()
+        st.subheader("Crossover Clock")
+        days = results["days"]
+        ev_wh = results["ev_wholesale"]
+        crossover_day = results["crossover_day"]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=days, y=results["ev_hold_curve"], mode="lines",
+                                 name="Hold for Retail", line=dict(color="#2980b9", width=3)))
+        fig.add_trace(go.Scatter(x=days, y=results["ev_transfer_curve"], mode="lines",
+                                 name="Transfer", line=dict(color="#8e44ad", width=2, dash="dash")))
+        fig.add_trace(go.Scatter(x=days, y=results["ev_expedite_curve"], mode="lines",
+                                 name="Expedite Recon", line=dict(color="#27ae60", width=2, dash="dot")))
+        fig.add_hline(y=ev_wh, line_color="#e74c3c", line_width=2.5, line_dash="longdash",
+                      annotation_text=f"  Wholesale Floor  ${ev_wh:,.0f}",
+                      annotation_position="right", annotation_font_color="#e74c3c")
+        if crossover_day is not None:
+            fig.add_vline(x=crossover_day, line_color="#e74c3c", line_width=1.5, line_dash="dot",
+                          annotation_text=f"  Crossover Day {crossover_day}",
+                          annotation_position="top right", annotation_font_color="#e74c3c")
+        fig.update_layout(
+            title=f"Expected Value — {strategy_mode}  |  Demand: {demand_label}  |  Recon: {recon_pressure}",
+            xaxis_title="Days from Today", yaxis_title="Expected Value ($)",
+            height=400, hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(t=80, r=160),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if crossover_day == 0:
+            st.error("Retail crossover has already occurred.")
+        elif crossover_day is not None:
+            st.warning(f"**{crossover_day} days** before retail hold becomes unfavorable.")
+        else:
+            st.success(f"No crossover within {hold_horizon}-day horizon. Retail economics remain favorable.")
+
+        # Recommendation Cards
+        st.subheader("Routing Recommendation")
+        rec = results["recommended_action"]
+        actions = {
+            "Hold for Retail":             {"ev": results["best_ev_hold"],     "speed": "Medium",      "color": "#2980b9"},
+            "Transfer to Stronger Market": {"ev": results["best_ev_transfer"], "speed": "Medium–Slow", "color": "#8e44ad"},
+            "Expedite Recon":              {"ev": results["best_ev_expedite"], "speed": "Fast",        "color": "#27ae60"},
+            "Liquidate to Wholesale":      {"ev": results["ev_wholesale"],     "speed": "Immediate",   "color": "#e74c3c"},
+        }
+        card_cols = st.columns(4)
+        for col, (action, data) in zip(card_cols, actions.items()):
+            is_rec = action == rec
+            border = f"2.5px solid {data['color']}" if is_rec else "1px solid #ddd"
+            bg     = "#f0f8ff" if is_rec else "#fafafa"
+            badge  = " ★ Recommended" if is_rec else ""
+            with col:
+                st.markdown(
+                    f'<div style="border:{border};border-radius:8px;padding:14px;background:{bg};min-height:100px">'
+                    f'<span style="color:{data["color"]};font-weight:700">{action}</span>'
+                    f'<span style="color:{data["color"]};font-size:0.78rem">{badge}</span><br><br>'
+                    f'<b>EV:</b> ${data["ev"]:,.0f}<br>'
+                    f'<b>Speed:</b> {data["speed"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # Acquisition Confidence
+        st.divider()
+        st.subheader("Acquisition Confidence")
+        conf_score = results["acquisition_confidence_score"]
+        conf_label = results["acquisition_confidence_label"]
+        conf_color = {"High": "#27ae60", "Medium": "#f39c12", "Low": "#e74c3c"}[conf_label]
+        ac1, ac2 = st.columns([1, 3])
+        with ac1:
+            st.markdown(
+                f'<div style="text-align:center;padding:24px 16px;border:2px solid {conf_color};border-radius:10px">'
+                f'<div style="font-size:52px;font-weight:800;color:{conf_color}">{conf_score}</div>'
+                f'<div style="font-size:22px;font-weight:600;color:{conf_color}">{conf_label}</div>'
+                f'<div style="font-size:11px;color:#888;margin-top:8px">Acquisition Confidence</div></div>',
+                unsafe_allow_html=True,
+            )
+        with ac2:
+            st.markdown("**Decision Rationale**")
+            st.info(results["decision_rationale"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.header("Export Bid Sheet")
+
+    if not st.session_state.scored_flag or not st.session_state.scored:
+        st.info("Score an auction manifest in the Auction Drop tab to generate a bid sheet.")
+    else:
+        impact = compute_portfolio_impact(
+            st.session_state.scored, st.session_state.bid_status,
+            st.session_state.ceiling_overrides, lot_state,
+        )
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Units to Bid",         impact["units_to_bid"])
+        e2.metric("Capital Required",     f"${impact['capital_required']:,.0f}")
+        e3.metric("Expected Gross",       f"${impact['expected_gross']:,.0f}")
+
+        st.divider()
+        active_bids = [sv for sv in st.session_state.scored
+                       if st.session_state.bid_status.get(sv["vid"], sv["status"]) == "bid"]
+        active_bids_sorted = sorted(active_bids, key=lambda x: x.get("rank_score") or 0, reverse=True)
+
+        bid_rows = []
+        for rank_idx, sv in enumerate(active_bids_sorted, 1):
+            effective_ceiling = st.session_state.ceiling_overrides.get(sv["vid"], sv.get("bid_ceiling") or 0)
+            bid_rows.append({
+                "Rank":               rank_idx,
+                "Vehicle":            sv["label"],
+                "Segment":            SEGMENT_LABELS.get(sv["segment"], sv["segment"]),
+                "Bid Ceiling ($)":    int(effective_ceiling),
+                "Auction Price ($)":  int(sv.get("auction_price", 0)),
+                "Expected Margin ($)": int(sv.get("expected_margin") or 0),
+                "Recon Est. ($)":     int(sv.get("recon_cost") or 0),
+                "Recon Days":         sv.get("recon_days", 0),
+                "Portfolio Fit":      round(sv.get("portfolio_fit") or 0, 2),
+                "Rationale":          sv.get("rationale", ""),
+            })
+
+        if bid_rows:
+            bid_df = pd.DataFrame(bid_rows)
+            st.dataframe(bid_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download Bid Sheet (CSV)",
+                data=bid_df.to_csv(index=False).encode("utf-8"),
+                file_name="bid_sheet.csv",
+                mime="text/csv",
+                type="primary",
+            )
+        else:
+            st.info("No vehicles in bid list. Move vehicles from Skip to build your list.")
+
+        if impact["concentration_warnings"]:
+            st.divider()
+            st.warning("**Concentration Warnings:**\n" +
+                       "\n".join(f"- {w}" for w in impact["concentration_warnings"]))
+
+# ── Footer ─────────────────────────────────────────────────────────────────────
+st.divider()
+st.caption("Crossline v0.2 — Auction Drop Decision Engine")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — AUCTION DROP
@@ -504,9 +811,8 @@ with tab1:
                                 st.markdown(
                                     f"**Bid ceiling:** ${ceiling:,.0f}  \n"
                                     f"**Ask:** ${ask:,.0f}  \n"
-                                    f"**Gap:** <span style='color:red'>-${gap:,.0f}</span>  \n"
-                                    f"**Margin at ask:** <span style='color:red'>${margin:,.0f}</span>",
-                                    unsafe_allow_html=True,
+                                    f"**Gap:** :red[-${gap:,.0f}]  \n"
+                                    f"**Margin at ask:** :red[${margin:,.0f}]",
                                 )
                                 st.caption(f"_Would bid if auction price drops below ${ceiling:,.0f}_")
                         else:
@@ -518,310 +824,3 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — CURRENT LOT
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    st.header("Current Lot")
-    st.caption("Existing portfolio — the lot state context the auction model scores against.")
-
-    # Apply filters
-    filt = df.copy()
-    if sel_source != "All": filt = filt[filt["source_channel"] == sel_source]
-    if sel_ret    != "All": filt = filt[filt["retailability_state"] == sel_ret]
-    if sel_market != "All": filt = filt[filt["market_cluster"] == sel_market]
-    if sel_body   != "All": filt = filt[filt["body_type"] == sel_body]
-    if sel_price  != "All": filt = filt[filt["price_band"] == sel_price]
-    if sel_age    != "All": filt = filt[filt["age_band"] == sel_age]
-
-    if filt.empty:
-        st.warning("No cohorts match the selected filters. Adjust Portfolio Analysis Settings in the sidebar.")
-    else:
-        # Segment overview
-        st.subheader("Segment Overview (Lot State)")
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            seg_counts  = lot_state["segment_counts"]
-            seg_targets = lot_state["segment_targets"]
-            seg_names   = [SEGMENT_LABELS.get(s, s) for s in seg_counts]
-            fig_seg = go.Figure()
-            fig_seg.add_bar(name="Current", x=seg_names, y=list(seg_counts.values()),
-                            marker_color="#2980b9", opacity=0.85)
-            fig_seg.add_scatter(name="Target", x=seg_names, y=list(seg_targets.values()),
-                                mode="markers", marker=dict(color="#e74c3c", size=10, symbol="diamond"))
-            fig_seg.update_layout(title="Segment Counts vs Targets", height=300,
-                                  margin=dict(t=40, b=60), xaxis_tickangle=-45)
-            st.plotly_chart(fig_seg, use_container_width=True)
-
-        with sc2:
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("Recon Bays",    lot_state["recon_bays_total"])
-            r2.metric("Occupied",      lot_state["recon_bays_occupied"])
-            r3.metric("Queue Depth",   lot_state["recon_queue_depth"])
-            r4.metric("Avg Days",      f"{lot_state['avg_days_on_lot']:.0f}")
-
-            wi_data = lot_state["wholesale_index_deltas"]
-            wi_rows = [{"Segment": SEGMENT_LABELS.get(s, s), "Delta": f"{v*100:+.1f}%"}
-                       for s, v in wi_data.items() if v != 0.0]
-            if wi_rows:
-                st.markdown("**Wholesale Index Movement**")
-                st.dataframe(pd.DataFrame(wi_rows), hide_index=True, use_container_width=True, height=220)
-
-        st.divider()
-        st.subheader("Cohort Portfolio")
-
-        BASE_SCENARIO = {"wholesale_shock": 0.0, "demand_mult": 1.0, "recon_pressure": "medium"}
-
-        @st.cache_data
-        def compute_portfolio_stats(cohort_ids_json):
-            all_df = load_data()
-            results = []
-            for _, row in all_df.iterrows():
-                r  = evaluate_cohort(row, BASE_SCENARIO, "Balanced", 0.0, 30)
-                cd = r["crossover_day"]
-                results.append({
-                    "cohort_id": row["cohort_id"],
-                    "ev_gap": r["best_ev_hold"] - r["ev_wholesale"],
-                    "at_risk": 1 if (cd is not None and cd <= 10) else 0,
-                    "crossover_day_base": cd,
-                })
-            return pd.DataFrame(results)
-
-        portfolio_stats = compute_portfolio_stats(str(sorted(df["cohort_id"].tolist())))
-        filt_stats      = filt.merge(portfolio_stats, on="cohort_id")
-
-        at_risk_n  = int(filt_stats["at_risk"].sum())
-        recon_n    = int(filt[filt["retailability_state"].isin(["recon_heavy", "recon_light"])].shape[0])
-        total_n    = len(filt)
-        total_u    = int(filt["cohort_units"].sum())
-        est_val    = float((filt["current_expected_retail_price"] * filt["cohort_units"]).sum())
-        avg_d      = float(filt["days_since_acquisition"].mean())
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Cohorts",             total_n)
-        k2.metric("Total Units",         f"{total_u:,}")
-        k3.metric("Est. Portfolio Value", f"${est_val:,.0f}")
-        k4.metric("At Risk (≤10d)",      f"{at_risk_n}", delta=f"{at_risk_n/total_n*100:.0f}%", delta_color="inverse")
-        k5.metric("Recon Trapped",       f"{recon_n}",   delta=f"{recon_n/total_n*100:.0f}%",   delta_color="inverse")
-        st.caption(f"Avg days since acquisition: **{avg_d:.1f}**")
-
-        STATE_COLORS = {
-            "frontline_ready": "#27ae60", "recon_light": "#f39c12",
-            "recon_heavy": "#e74c3c",     "borderline_retail": "#e67e22",
-            "wholesale_likely": "#c0392b",
-        }
-
-        pc1, pc2 = st.columns(2)
-        with pc1:
-            ret_cnt = (filt.groupby("retailability_state")["cohort_id"].count().reset_index()
-                       .rename(columns={"cohort_id": "Cohorts", "retailability_state": "State"}))
-            fig_bar = px.bar(ret_cnt, x="State", y="Cohorts", color="State",
-                             color_discrete_map=STATE_COLORS, title="Cohorts by Retailability State")
-            fig_bar.update_layout(showlegend=False, height=300, margin=dict(t=40, b=30))
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        with pc2:
-            fig_scat = px.scatter(
-                filt_stats, x="days_since_acquisition", y="ev_gap",
-                color="retailability_state", color_discrete_map=STATE_COLORS,
-                hover_data=["cohort_id", "market_cluster", "body_type", "crossover_day_base"],
-                title="Days Since Acquisition vs EV Gap",
-                labels={"days_since_acquisition": "Days Since Acq.", "ev_gap": "EV Gap ($)", "retailability_state": "State"},
-            )
-            fig_scat.add_hline(y=0, line_dash="dash", line_color="#e74c3c",
-                               annotation_text="Wholesale Beats Retail", annotation_position="bottom right")
-            fig_scat.update_layout(height=300, showlegend=False, margin=dict(t=40, b=30))
-            st.plotly_chart(fig_scat, use_container_width=True)
-
-        # Cohort Drilldown
-        st.divider()
-        st.subheader("Cohort Drilldown")
-        cohort_ids = filt["cohort_id"].tolist()
-
-        def cohort_label(cid):
-            row = filt[filt["cohort_id"] == cid].iloc[0]
-            return (f"{cid}  ·  {row['retailability_state'].replace('_',' ').title()}  ·  "
-                    f"{row['market_cluster']}  ·  {row['body_type'].upper()}")
-
-        sel_id = st.selectbox("Select a cohort:", cohort_ids, format_func=cohort_label, key="cohort_sel")
-
-        display_df = filt[[
-            "cohort_id", "market_cluster", "source_channel", "retailability_state",
-            "body_type", "price_band", "age_band", "cohort_units",
-            "days_since_acquisition", "current_expected_retail_price", "wholesale_floor_price",
-        ]].copy()
-        display_df["current_expected_retail_price"] = display_df["current_expected_retail_price"].map("${:,.0f}".format)
-        display_df["wholesale_floor_price"]          = display_df["wholesale_floor_price"].map("${:,.0f}".format)
-        display_df.columns = ["Cohort ID", "Market", "Source", "Retailability",
-                               "Body", "Price Band", "Age Band", "Units",
-                               "Days Acq.", "Retail Price", "Wholesale Floor"]
-        st.dataframe(display_df, use_container_width=True, hide_index=True, height=220)
-
-        cohort  = filt[filt["cohort_id"] == sel_id].iloc[0]
-        results = evaluate_cohort(cohort, portfolio_scenario, strategy_mode, markdown_pct, hold_horizon)
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.markdown("**Descriptor**")
-            for lbl, val in [("Body", cohort["body_type"].capitalize()),
-                              ("Age Band", cohort["age_band"].replace("_", " ")),
-                              ("Mileage Band", cohort["mileage_band"].replace("_", " ")),
-                              ("Source", cohort["source_channel"].replace("_", " ").title()),
-                              ("Market", cohort["market_cluster"]),
-                              ("Units", cohort["cohort_units"])]:
-                st.markdown(f"- {lbl}: **{val}**")
-        with d2:
-            st.markdown("**Timing**")
-            for lbl, val in [("Days Since Acq.", cohort["days_since_acquisition"]),
-                              ("Days in Recon", cohort["days_in_recon"]),
-                              ("Retailability", cohort["retailability_state"].replace("_", " ").title())]:
-                st.markdown(f"- {lbl}: **{val}**")
-        with d3:
-            st.markdown("**Economics**")
-            for lbl, val in [("Acquisition Cost", f"${cohort['avg_acquisition_cost']:,.0f}"),
-                              ("Expected Recon", f"${cohort['expected_recon_cost']:,.0f}"),
-                              ("Retail Price", f"${cohort['current_expected_retail_price']:,.0f}"),
-                              ("Wholesale Floor", f"${cohort['wholesale_floor_price']:,.0f}"),
-                              ("Market Demand", f"{cohort['market_demand_index']:.2f}")]:
-                st.markdown(f"- {lbl}: **{val}**")
-
-        # Crossover Clock
-        st.divider()
-        st.subheader("Crossover Clock")
-        days = results["days"]
-        ev_wh = results["ev_wholesale"]
-        crossover_day = results["crossover_day"]
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=days, y=results["ev_hold_curve"], mode="lines",
-                                 name="Hold for Retail", line=dict(color="#2980b9", width=3)))
-        fig.add_trace(go.Scatter(x=days, y=results["ev_transfer_curve"], mode="lines",
-                                 name="Transfer", line=dict(color="#8e44ad", width=2, dash="dash")))
-        fig.add_trace(go.Scatter(x=days, y=results["ev_expedite_curve"], mode="lines",
-                                 name="Expedite Recon", line=dict(color="#27ae60", width=2, dash="dot")))
-        fig.add_hline(y=ev_wh, line_color="#e74c3c", line_width=2.5, line_dash="longdash",
-                      annotation_text=f"  Wholesale Floor  ${ev_wh:,.0f}",
-                      annotation_position="right", annotation_font_color="#e74c3c")
-        if crossover_day is not None:
-            fig.add_vline(x=crossover_day, line_color="#e74c3c", line_width=1.5, line_dash="dot",
-                          annotation_text=f"  Crossover Day {crossover_day}",
-                          annotation_position="top right", annotation_font_color="#e74c3c")
-        fig.update_layout(
-            title=f"Expected Value — {strategy_mode}  |  Demand: {demand_label}  |  Recon: {recon_pressure}",
-            xaxis_title="Days from Today", yaxis_title="Expected Value ($)",
-            height=400, hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(t=80, r=160),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        if crossover_day == 0:
-            st.error("Retail crossover has already occurred.")
-        elif crossover_day is not None:
-            st.warning(f"**{crossover_day} days** before retail hold becomes unfavorable.")
-        else:
-            st.success(f"No crossover within {hold_horizon}-day horizon. Retail economics remain favorable.")
-
-        # Recommendation Cards
-        st.subheader("Routing Recommendation")
-        rec = results["recommended_action"]
-        actions = {
-            "Hold for Retail":             {"ev": results["best_ev_hold"],     "speed": "Medium",      "color": "#2980b9"},
-            "Transfer to Stronger Market": {"ev": results["best_ev_transfer"], "speed": "Medium–Slow", "color": "#8e44ad"},
-            "Expedite Recon":              {"ev": results["best_ev_expedite"], "speed": "Fast",        "color": "#27ae60"},
-            "Liquidate to Wholesale":      {"ev": results["ev_wholesale"],     "speed": "Immediate",   "color": "#e74c3c"},
-        }
-        card_cols = st.columns(4)
-        for col, (action, data) in zip(card_cols, actions.items()):
-            is_rec = action == rec
-            border = f"2.5px solid {data['color']}" if is_rec else "1px solid #ddd"
-            bg     = "#f0f8ff" if is_rec else "#fafafa"
-            badge  = " ★ Recommended" if is_rec else ""
-            with col:
-                st.markdown(
-                    f'<div style="border:{border};border-radius:8px;padding:14px;background:{bg};min-height:100px">'
-                    f'<span style="color:{data["color"]};font-weight:700">{action}</span>'
-                    f'<span style="color:{data["color"]};font-size:0.78rem">{badge}</span><br><br>'
-                    f'<b>EV:</b> ${data["ev"]:,.0f}<br>'
-                    f'<b>Speed:</b> {data["speed"]}</div>',
-                    unsafe_allow_html=True,
-                )
-
-        # Acquisition Confidence
-        st.divider()
-        st.subheader("Acquisition Confidence")
-        conf_score = results["acquisition_confidence_score"]
-        conf_label = results["acquisition_confidence_label"]
-        conf_color = {"High": "#27ae60", "Medium": "#f39c12", "Low": "#e74c3c"}[conf_label]
-        ac1, ac2 = st.columns([1, 3])
-        with ac1:
-            st.markdown(
-                f'<div style="text-align:center;padding:24px 16px;border:2px solid {conf_color};border-radius:10px">'
-                f'<div style="font-size:52px;font-weight:800;color:{conf_color}">{conf_score}</div>'
-                f'<div style="font-size:22px;font-weight:600;color:{conf_color}">{conf_label}</div>'
-                f'<div style="font-size:11px;color:#888;margin-top:8px">Acquisition Confidence</div></div>',
-                unsafe_allow_html=True,
-            )
-        with ac2:
-            st.markdown("**Decision Rationale**")
-            st.info(results["decision_rationale"])
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — EXPORT
-# ══════════════════════════════════════════════════════════════════════════════
-with tab3:
-    st.header("Export Bid Sheet")
-
-    if not st.session_state.scored_flag or not st.session_state.scored:
-        st.info("Score an auction manifest in the Auction Drop tab to generate a bid sheet.")
-    else:
-        impact = compute_portfolio_impact(
-            st.session_state.scored, st.session_state.bid_status,
-            st.session_state.ceiling_overrides, lot_state,
-        )
-        e1, e2, e3 = st.columns(3)
-        e1.metric("Units to Bid",         impact["units_to_bid"])
-        e2.metric("Capital Required",     f"${impact['capital_required']:,.0f}")
-        e3.metric("Expected Gross",       f"${impact['expected_gross']:,.0f}")
-
-        st.divider()
-        active_bids = [sv for sv in st.session_state.scored
-                       if st.session_state.bid_status.get(sv["vid"], sv["status"]) == "bid"]
-        active_bids_sorted = sorted(active_bids, key=lambda x: x.get("rank_score") or 0, reverse=True)
-
-        bid_rows = []
-        for rank_idx, sv in enumerate(active_bids_sorted, 1):
-            effective_ceiling = st.session_state.ceiling_overrides.get(sv["vid"], sv.get("bid_ceiling") or 0)
-            bid_rows.append({
-                "Rank":               rank_idx,
-                "Vehicle":            sv["label"],
-                "Segment":            SEGMENT_LABELS.get(sv["segment"], sv["segment"]),
-                "Bid Ceiling ($)":    int(effective_ceiling),
-                "Auction Price ($)":  int(sv.get("auction_price", 0)),
-                "Expected Margin ($)": int(sv.get("expected_margin") or 0),
-                "Recon Est. ($)":     int(sv.get("recon_cost") or 0),
-                "Recon Days":         sv.get("recon_days", 0),
-                "Portfolio Fit":      round(sv.get("portfolio_fit") or 0, 2),
-                "Rationale":          sv.get("rationale", ""),
-            })
-
-        if bid_rows:
-            bid_df = pd.DataFrame(bid_rows)
-            st.dataframe(bid_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download Bid Sheet (CSV)",
-                data=bid_df.to_csv(index=False).encode("utf-8"),
-                file_name="bid_sheet.csv",
-                mime="text/csv",
-                type="primary",
-            )
-        else:
-            st.info("No vehicles in bid list. Move vehicles from Skip to build your list.")
-
-        if impact["concentration_warnings"]:
-            st.divider()
-            st.warning("**Concentration Warnings:**\n" +
-                       "\n".join(f"- {w}" for w in impact["concentration_warnings"]))
-
-# ── Footer ─────────────────────────────────────────────────────────────────────
-st.divider()
-st.caption("Crossline v0.2 — Auction Drop Decision Engine")
