@@ -26,7 +26,7 @@ BASE_SALE_PROB = {
     "recon_light":       0.78,
     "recon_heavy":       0.45,
     "borderline_retail": 0.58,
-    "wholesale_likely":  0.30,
+    "low_retail_fit":    0.30,
 }
 
 TRANSFER_TRANSIT_DAYS = 4   # days vehicle is in transit before it can sell
@@ -68,7 +68,7 @@ def evaluate_hold_path(cohort, scenario, strategy_mode="Balanced",
 def evaluate_wholesale_path(cohort, scenario):
     """Immediate liquidation expected value (net of acquisition cost)."""
     shock = scenario.get("wholesale_shock", 0.0)
-    gross = cohort["wholesale_floor_price"] * (1 + shock)
+    gross = cohort["market_floor_price"] * (1 + shock)
     return float(gross - cohort["avg_acquisition_cost"])
 
 
@@ -155,7 +155,7 @@ def evaluate_expedite_path(cohort, scenario, strategy_mode="Balanced", horizon=3
 # ── Derived outputs ───────────────────────────────────────────────────────
 
 def compute_crossover_day(ev_hold_curve, ev_wholesale):
-    """First day where expected retail hold value drops below wholesale."""
+    """First day where expected retail hold value drops below the market floor."""
     for d, val in enumerate(ev_hold_curve):
         if val < ev_wholesale:
             return int(d)
@@ -173,7 +173,7 @@ def compute_acquisition_confidence(cohort, results):
         score += 10
     elif rec == "Expedite Recon":
         score -= 10
-    elif rec == "Liquidate to Wholesale":
+    elif rec == "Liquidate":
         score -= 20
 
     crossover_day = results.get("crossover_day")
@@ -183,7 +183,7 @@ def compute_acquisition_confidence(cohort, results):
     if cohort["days_since_acquisition"] > 45:
         score -= 10
 
-    if cohort["retailability_state"] in ("recon_heavy", "wholesale_likely"):
+    if cohort["retailability_state"] in ("recon_heavy", "low_retail_fit"):
         score -= 10
 
     # All retail paths have negative EV → bad buy signal
@@ -204,20 +204,20 @@ def choose_recommendation(ev_hold, ev_transfer, ev_expedite, ev_wholesale, strat
     """Pick the highest-EV action after strategy-mode adjustments."""
     params = STRATEGY_PARAMS[strategy_mode]
 
-    # Margin Max: penalize wholesale slightly (patient; hold longer)
-    # Turn Max: bonus to wholesale (impatient; willing to exit)
+    # Margin Max: penalize exit slightly (patient; hold longer)
+    # Turn Max: bonus to exit (impatient; willing to liquidate)
     # Use carry_weight as a proxy for time preference
-    wholesale_adj = {
-        "Margin Max": -200,   # harder to justify wholesale
+    exit_adj = {
+        "Margin Max": -200,   # harder to justify liquidation
         "Balanced":    0,
-        "Turn Max":  +300,    # easier to justify wholesale
+        "Turn Max":  +300,    # easier to justify liquidation
     }[strategy_mode]
 
     candidates = {
         "Hold for Retail":              ev_hold,
         "Transfer to Stronger Market":  ev_transfer,
         "Expedite Recon":               ev_expedite,
-        "Liquidate to Wholesale":       ev_wholesale + wholesale_adj,
+        "Liquidate":                    ev_wholesale + exit_adj,
     }
     return max(candidates, key=candidates.get)
 
@@ -233,7 +233,7 @@ def generate_rationale(cohort, results):
 
     if rec == "Hold for Retail":
         return (
-            f"Retail economics remain above the wholesale floor for {days_left}. "
+            f"Retail economics remain strong for {days_left}. "
             f"This cohort still has healthy demand in {cohort['market_cluster']} "
             f"(demand index: {cohort['market_demand_index']:.2f}). "
             f"Continue monitoring for signs of softening. "
@@ -256,7 +256,7 @@ def generate_rationale(cohort, results):
             f"preserving retail economics before the crossover at {days_left}. "
             f"Moving this cohort to frontline immediately captures meaningful retail upside."
         )
-    elif rec == "Liquidate to Wholesale":
+    elif rec == "Liquidate":
         if crossover_day == 0:
             timing = "The retail crossover has already occurred."
         elif crossover_day is not None:
@@ -266,8 +266,8 @@ def generate_rationale(cohort, results):
         return (
             f"{timing} "
             f"Under the selected strategy, additional hold time increases downside. "
-            f"Liquidating at the wholesale floor of "
-            f"${cohort['wholesale_floor_price']:,.0f} "
+            f"Retail economics don't support this purchase at current market prices — "
+            f"liquidating at ${cohort['market_floor_price']:,.0f} "
             f"preserves more value than waiting."
         )
     return ""

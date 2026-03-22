@@ -52,8 +52,8 @@ def _skip_tag(sv):
         if gap_pct > 0.20:
             return "Underwater", "#c0392b"
         return "Thin margin", "#e74c3c"
-    if reason == "wholesale_softening":
-        return "Weak exit", "#e67e22"
+    if reason == "market_softening":
+        return "Soft market", "#e67e22"
     if reason == "recon_queue_full":
         return "Queue full", "#f39c12"
     if reason == "slow_segment":
@@ -99,6 +99,7 @@ if "manifest_input_df" not in st.session_state:
 with st.sidebar:
     st.image("crossline_logo.png", width=200)
     st.markdown("## CROSSLINE")
+    st.caption("Designed to set portfolio context before auction day. Buyers bring lane-level judgment the model can't replicate.")
 
     st.subheader("Lot Settings")
     ls = DEFAULT_LOT_STATE
@@ -153,7 +154,7 @@ with st.sidebar:
         markdown_pct  = st.slider("Markdown %", 1, 10, 3, key="strat_mkd_pct") / 100 if use_markdown else 0.0
 
         st.markdown("**Scenario**")
-        ws_shock_pct  = st.slider("Wholesale Shock (%)", -10, 5, 0, key="scen_ws")
+        ws_shock_pct  = st.slider("Market Price Shock (%)", -10, 5, 0, key="scen_ws")
         demand_label  = st.select_slider("Demand Strength", ["Weak", "Base", "Strong"], value="Base", key="scen_demand")
         recon_pressure = st.select_slider("Recon Pressure", ["low", "medium", "high"], value="medium", key="scen_recon")
 
@@ -226,11 +227,11 @@ with tab2:
             r3.metric("Queue Depth",   lot_state["recon_queue_depth"])
             r4.metric("Avg Days",      f"{lot_state['avg_days_on_lot']:.0f}")
 
-            wi_data = lot_state["wholesale_index_deltas"]
+            wi_data = lot_state["market_index_deltas"]
             wi_rows = [{"Segment": SEGMENT_LABELS.get(s, s), "Delta": f"{v*100:+.1f}%"}
                        for s, v in wi_data.items() if v != 0.0]
             if wi_rows:
-                st.markdown("**Wholesale Index Movement**")
+                st.markdown("**Market Index Movement**")
                 st.dataframe(pd.DataFrame(wi_rows), hide_index=True, use_container_width=True, height=220)
 
         st.divider()
@@ -274,7 +275,7 @@ with tab2:
         STATE_COLORS = {
             "frontline_ready": "#27ae60", "recon_light": "#f39c12",
             "recon_heavy": "#e74c3c",     "borderline_retail": "#e67e22",
-            "wholesale_likely": "#c0392b",
+            "low_retail_fit": "#c0392b",
         }
 
         pc1, pc2 = st.columns(2)
@@ -295,7 +296,7 @@ with tab2:
                 labels={"days_since_acquisition": "Days Since Acq.", "ev_gap": "EV Gap ($)", "retailability_state": "State"},
             )
             fig_scat.add_hline(y=0, line_dash="dash", line_color="#e74c3c",
-                               annotation_text="Wholesale Beats Retail", annotation_position="bottom right")
+                               annotation_text="Retail margin at risk", annotation_position="bottom right")
             fig_scat.update_layout(height=300, showlegend=False, margin=dict(t=40, b=30))
             st.plotly_chart(fig_scat, use_container_width=True)
 
@@ -314,13 +315,13 @@ with tab2:
         display_df = filt[[
             "cohort_id", "market_cluster", "source_channel", "retailability_state",
             "body_type", "price_band", "age_band", "cohort_units",
-            "days_since_acquisition", "current_expected_retail_price", "wholesale_floor_price",
+            "days_since_acquisition", "current_expected_retail_price", "market_floor_price",
         ]].copy()
         display_df["current_expected_retail_price"] = display_df["current_expected_retail_price"].map("${:,.0f}".format)
-        display_df["wholesale_floor_price"]          = display_df["wholesale_floor_price"].map("${:,.0f}".format)
+        display_df["market_floor_price"]             = display_df["market_floor_price"].map("${:,.0f}".format)
         display_df.columns = ["Cohort ID", "Market", "Source", "Retailability",
                                "Body", "Price Band", "Age Band", "Units",
-                               "Days Acq.", "Retail Price", "Wholesale Floor"]
+                               "Days Acq.", "Retail Price", "Market Floor"]
         st.dataframe(display_df, use_container_width=True, hide_index=True, height=220)
 
         cohort  = filt[filt["cohort_id"] == sel_id].iloc[0]
@@ -347,7 +348,7 @@ with tab2:
             for lbl, val in [("Acquisition Cost", f"${cohort['avg_acquisition_cost']:,.0f}"),
                               ("Expected Recon", f"${cohort['expected_recon_cost']:,.0f}"),
                               ("Retail Price", f"${cohort['current_expected_retail_price']:,.0f}"),
-                              ("Wholesale Floor", f"${cohort['wholesale_floor_price']:,.0f}"),
+                              ("Market Floor", f"${cohort['market_floor_price']:,.0f}"),
                               ("Market Demand", f"{cohort['market_demand_index']:.2f}")]:
                 st.markdown(f"- {lbl}: **{val}**")
 
@@ -366,7 +367,7 @@ with tab2:
         fig.add_trace(go.Scatter(x=days, y=results["ev_expedite_curve"], mode="lines",
                                  name="Expedite Recon", line=dict(color="#27ae60", width=2, dash="dot")))
         fig.add_hline(y=ev_wh, line_color="#e74c3c", line_width=2.5, line_dash="longdash",
-                      annotation_text=f"  Wholesale Floor  ${ev_wh:,.0f}",
+                      annotation_text=f"  Market Floor  ${ev_wh:,.0f}",
                       annotation_position="right", annotation_font_color="#e74c3c")
         if crossover_day is not None:
             fig.add_vline(x=crossover_day, line_color="#e74c3c", line_width=1.5, line_dash="dot",
@@ -395,7 +396,7 @@ with tab2:
             "Hold for Retail":             {"ev": results["best_ev_hold"],     "speed": "Medium",      "color": "#2980b9"},
             "Transfer to Stronger Market": {"ev": results["best_ev_transfer"], "speed": "Medium–Slow", "color": "#8e44ad"},
             "Expedite Recon":              {"ev": results["best_ev_expedite"], "speed": "Fast",        "color": "#27ae60"},
-            "Liquidate to Wholesale":      {"ev": results["ev_wholesale"],     "speed": "Immediate",   "color": "#e74c3c"},
+            "Liquidate":                   {"ev": results["ev_wholesale"],     "speed": "Immediate",   "color": "#e74c3c"},
         }
         card_cols = st.columns(4)
         for col, (action, data) in zip(card_cols, actions.items()):
@@ -492,6 +493,7 @@ with tab3:
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.divider()
 st.caption("Crossline v0.2 — Auction Drop Decision Engine")
+st.caption("Demo uses segment-average pricing. Production version would anchor to Edmunds/NADA market data or internal offer models.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — AUCTION DROP
@@ -739,7 +741,7 @@ with tab1:
                 carry_cost = avg_days_sale * lot_state.get("daily_carry_rate", 35)
                 eff_margin = (sv.get("expected_retail") or 0) - new_ceiling - (sv.get("recon_cost") or 0) - carry_cost
                 if new_ceiling > 0 and eff_margin < 0:
-                    st.error("At this price you're buying a wholesale loss.")
+                    st.error("At this price the retail margin is negative — no room for profit.")
                 elif new_ceiling > 0 and eff_margin < 800:
                     st.warning("Margin is thin at this price.")
 
@@ -766,7 +768,7 @@ with tab1:
             "condition_fail":     "⛔ Condition Fail (Non-Overridable)",
             "margin_insufficient": "💸 Margin Insufficient",
             "segment_overexposed": "📦 Segment Overexposed",
-            "wholesale_softening": "📉 Wholesale Softening",
+            "market_softening": "📉 Soft Market",
             "slow_segment":       "🐢 Slow Segment",
             "recon_risk":         "🔧 Recon Risk",
             "recon_queue_full":   "🚧 Recon Queue Full",

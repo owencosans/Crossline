@@ -12,7 +12,7 @@ def generate_cohorts(seed=42, n=60):
     source_channels = ["consumer_appraisal", "dealer_purchase", "auction"]
     retailability_states = [
         "frontline_ready", "recon_light", "recon_heavy",
-        "borderline_retail", "wholesale_likely",
+        "borderline_retail", "low_retail_fit",
     ]
     body_types = ["sedan", "suv", "truck", "cuv", "van", "ev"]
     price_bands = ["under_20k", "20k_30k", "30k_40k", "40k_plus"]
@@ -56,7 +56,7 @@ def generate_cohorts(seed=42, n=60):
         cohort_units = int(rng.integers(5, 40))
 
         # Timing — aged / at-risk cohorts have more days
-        if retailability_state in ["wholesale_likely", "recon_heavy"]:
+        if retailability_state in ["low_retail_fit", "recon_heavy"]:
             days_since_acq = int(rng.integers(20, 80))
         elif retailability_state == "borderline_retail":
             days_since_acq = int(rng.integers(10, 55))
@@ -88,7 +88,7 @@ def generate_cohorts(seed=42, n=60):
         lo, hi = price_lo_hi[price_band]
         avg_acquisition_cost = float(rng.uniform(lo, hi))
 
-        if retailability_state == "wholesale_likely":
+        if retailability_state == "low_retail_fit":
             retail_markup = rng.uniform(0.92, 1.04)
         elif retailability_state in ["recon_heavy", "borderline_retail"]:
             retail_markup = rng.uniform(1.04, 1.14)
@@ -103,11 +103,11 @@ def generate_cohorts(seed=42, n=60):
         else:
             expected_recon_cost = float(rng.uniform(50, 400))
 
-        if retailability_state == "wholesale_likely":
+        if retailability_state == "low_retail_fit":
             wholesale_fraction = rng.uniform(0.80, 0.96)
         else:
             wholesale_fraction = rng.uniform(0.68, 0.88)
-        wholesale_floor_price = avg_acquisition_cost * wholesale_fraction
+        market_floor_price = avg_acquisition_cost * wholesale_fraction
 
         daily_carry_depreciation = float(
             current_expected_retail_price * rng.uniform(0.0008, 0.0020)
@@ -131,7 +131,7 @@ def generate_cohorts(seed=42, n=60):
             rng.uniform(age_base_decay * 0.7, age_base_decay * 1.5)
         )
 
-        if retailability_state == "wholesale_likely":
+        if retailability_state == "low_retail_fit":
             sale_prob_decay = float(rng.uniform(0.040, 0.080))
         elif retailability_state in ["recon_heavy", "borderline_retail"]:
             sale_prob_decay = float(rng.uniform(0.020, 0.050))
@@ -158,7 +158,7 @@ def generate_cohorts(seed=42, n=60):
             "expected_recon_cost": round(expected_recon_cost, 2),
             "daily_carry_depreciation": round(daily_carry_depreciation, 2),
             "current_expected_retail_price": round(current_expected_retail_price, 2),
-            "wholesale_floor_price": round(wholesale_floor_price, 2),
+            "market_floor_price": round(market_floor_price, 2),
             "embedded_transfer_cost": round(embedded_transfer_cost, 2),
             "recon_priority_score": recon_priority_score,
             "market_demand_index": round(market_demand_index, 3),

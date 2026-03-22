@@ -99,8 +99,8 @@ DEFAULT_MARKET_CONTEXT: dict = {
         "spring_tax": 1.05, "summer": 0.98, "fall": 0.97, "winter": 0.92,
     },
     # Regional demand indices set to produce spec narrative with sample manifest:
-    # Sedans bid strongly (undersupplied), SUVs marginal/skip (oversupplied+softening),
-    # Trucks bid (undersupplied+wholesale firming), Odyssey bids (minivan undersupplied).
+    # Sedans bid strongly (undersupplied), SUVs marginal/skip (oversupplied+market softening),
+    # Trucks bid (undersupplied+market firming), Odyssey bids (minivan undersupplied).
     "regional_demand_index": {
         "compact_sedan":   1.00,
         "midsize_sedan":   0.97,
@@ -154,7 +154,7 @@ DEFAULT_LOT_STATE: dict = {
         "pickup_full_size": 14, "pickup_midsize": 8,
         "minivan": 5, "luxury": 7, "sports": 2, "other": 2,
     },
-    "wholesale_index_deltas": {
+    "market_index_deltas": {
         "compact_sedan": 0.01, "midsize_sedan": 0.00, "full_size_sedan": 0.00,
         "compact_suv": -0.01, "midsize_suv": -0.02, "full_size_suv": -0.04,
         "pickup_full_size": 0.02, "pickup_midsize": 0.01,
@@ -166,7 +166,7 @@ DEFAULT_LOT_STATE: dict = {
 
 MARKET_SHOCKS: dict[str, dict] = {
     "wholesale_suv_drop": {
-        "label": "Wholesale SUV prices drop 4%",
+        "label": "Used SUV market prices drop 4%",
         "affected_segments": list(SUV_SEGMENTS),
         "risk_buffer_delta": 500, "demand_index_delta": 0.0, "recon_bays_delta": 0,
     },
@@ -181,7 +181,7 @@ MARKET_SHOCKS: dict[str, dict] = {
         "risk_buffer_delta": 0, "demand_index_delta": 0.0, "recon_bays_delta": -2,
     },
     "truck_wholesale_firms": {
-        "label": "Truck wholesale firms up 3%",
+        "label": "Used truck market prices firm up 3%",
         "affected_segments": list(TRUCK_SEGMENTS),
         "risk_buffer_delta": -300, "demand_index_delta": 0.0, "recon_bays_delta": 0,
     },
@@ -301,7 +301,7 @@ def calculate_bid_ceiling(
     carry_cost = avg_days_to_sale * daily_carry
     target_margin = max(mc["avg_retail_margin_by_segment"].get(segment, 1200), 800)
     risk_buffer = 200.0
-    w_delta = lot_state.get("wholesale_index_deltas", {}).get(segment, 0.0)
+    w_delta = lot_state.get("market_index_deltas", {}).get(segment, 0.0)
     if w_delta < -0.02:
         risk_buffer += 300
     if recon_cost > 2000:
@@ -351,7 +351,7 @@ def _get_primary_skip_reason(sv: dict, lot_state: dict) -> tuple[str, str, Optio
     target = targets.get(segment, 10)
     seg_velocity = velocities.get(segment, 0)
     avg_velocity = sum(velocities.values()) / max(len(velocities), 1)
-    w_delta = lot_state.get("wholesale_index_deltas", {}).get(segment, 0.0)
+    w_delta = lot_state.get("market_index_deltas", {}).get(segment, 0.0)
     if target > 0 and current / target > 1.15:
         over_pct = int((current / target - 1) * 100)
         return (
@@ -361,9 +361,9 @@ def _get_primary_skip_reason(sv: dict, lot_state: dict) -> tuple[str, str, Optio
         )
     if w_delta < -0.02:
         return (
-            "wholesale_softening",
-            f"Wholesale index dropped {abs(w_delta)*100:.1f}% in {seg_label} — exit risk elevated.",
-            "Wholesale index stabilizes in this segment.",
+            "market_softening",
+            f"Used vehicle market prices dropped {abs(w_delta)*100:.1f}% in {seg_label} — retail margins are compressed and the downside is elevated.",
+            "Market prices stabilize in this segment.",
         )
     # Only penalize slow velocity when we're NOT undersupplied — if we need units, slow velocity is less relevant
     if avg_velocity > 0 and seg_velocity / avg_velocity < 0.50 and current >= target:
@@ -393,7 +393,7 @@ def _generate_rationale(sv: dict, lot_state: dict) -> str:
     target = targets.get(segment, 10)
     need = target - current
     avg_days_to_sale = mc["avg_days_to_sale_by_segment"].get(segment, 30)
-    w_delta = lot_state.get("wholesale_index_deltas", {}).get(segment, 0.0)
+    w_delta = lot_state.get("market_index_deltas", {}).get(segment, 0.0)
     velocity = velocities.get(segment, 0)
 
     if sv["status"] == "bid":
@@ -412,7 +412,7 @@ def _generate_rationale(sv: dict, lot_state: dict) -> str:
         over = current - target
         if w_delta < -0.02:
             return (f"Skip. Already {over} units over target in {seg_label}. "
-                    f"Wholesale index dropped {abs(w_delta)*100:.0f}% this week — exit risk outweighs hold value.")
+                    f"Market prices dropped {abs(w_delta)*100:.0f}% this week — retail margins are compressed.")
         return (f"Skip. Already {over} units over target in {seg_label} ({current} vs target {target}). "
                 f"Adding more increases concentration risk.")
     if reason == "margin_insufficient":
@@ -423,7 +423,7 @@ def _generate_rationale(sv: dict, lot_state: dict) -> str:
         if sv.get("condition", 5.0) < 3.0:
             context.append(f"condition {sv['condition']:.1f} drives up recon to ${sv.get('recon_cost', 0):,.0f}")
         if w_delta < -0.02:
-            context.append(f"wholesale index down {abs(w_delta)*100:.1f}% adds risk buffer")
+            context.append(f"market prices down {abs(w_delta)*100:.1f}% compress retail margins")
         current = counts.get(segment, 0)
         target_c = targets.get(segment, 10)
         if target_c > 0 and current / target_c > 1.15:
@@ -440,9 +440,9 @@ def _generate_rationale(sv: dict, lot_state: dict) -> str:
     if reason == "slow_segment":
         return (f"Skip. {seg_label} moving {velocity} units/month — "
                 f"too slow for current lot depth.")
-    if reason == "wholesale_softening":
-        return (f"Skip. Wholesale index dropped {abs(w_delta)*100:.1f}% in {seg_label}. "
-                f"Buying into a softening segment increases exit risk.")
+    if reason == "market_softening":
+        return (f"Pass. Market prices in {seg_label} dropped {abs(w_delta)*100:.1f}% this week — "
+                f"retail margins are compressed and the downside is elevated.")
     if reason == "condition_fail":
         return sv.get("skip_detail", "Skip. Non-overridable condition issue detected in notes.")
     return sv.get("skip_detail", "Skip.")
